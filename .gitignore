@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project
+NLP_avito_interns-dataset/
+cache/
+.idea/
+answer*.csv

@@ -1,0 +1,9 @@
+pandas
+pyarrow
+numpy
+scipy
+scikit-learn
+pymorphy3
+pymorphy3-dicts-ru
+PyStemmer
+tqdm
