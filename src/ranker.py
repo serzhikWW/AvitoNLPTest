@@ -19,6 +19,8 @@
 """
 from collections import Counter, defaultdict
 
+import lightgbm as lgb
+
 import numpy as np
 import pandas as pd
 
@@ -202,3 +204,20 @@ class FeatureBuilder:
         for f in ["bm25", "cos", "fuse", "bm25_title"]:
             out[f"{f}_rank"] = out.groupby("query_id")[f].rank(ascending=False, method="first")
         return pd.concat([out, self.item_feats.iloc[out.item_idx.values].reset_index(drop=True)], axis=1)
+
+
+def fit_ranker(X: pd.DataFrame, feats: list[str], params: dict = LGB_PARAMS):
+    """LightGBM lambdarank на всех запросах X (группы = query_id)."""
+    X = X.sort_values("query_id", kind="stable")
+    return lgb.LGBMRanker(**params).fit(X[feats], X.label, group=X.groupby("query_id", sort=True).size().values)
+
+
+def oof_scores(X: pd.DataFrame, feats: list[str], params: dict = LGB_PARAMS, n_folds: int = 5) -> np.ndarray:
+    """Out-of-fold скоры ранкера: 5-fold по запросам, каждый запрос скорится моделью, его не видевшей."""
+    from sklearn.model_selection import GroupKFold
+
+    oof = np.zeros(len(X))
+    for tr_idx, te_idx in GroupKFold(n_folds).split(X, groups=X.query_id):
+        m = fit_ranker(X.iloc[tr_idx], feats, params)
+        oof[te_idx] = m.predict(X.iloc[te_idx][feats])
+    return oof
