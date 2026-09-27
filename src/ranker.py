@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 from .bm25 import SparseBM25
-from .location import LocationPrior
+from .location import GeoPrior, LocationPrior
 from .retrieval import batched, topk_indices
 from .text import normalize
 from .tokens import item_tokens
@@ -41,6 +41,15 @@ LGB_PARAMS = dict(
     subsample=0.8, subsample_freq=1, colsample_bytree=0.8, lambdarank_truncation_level=60,
     random_state=42, deterministic=True, force_row_wise=True, verbose=-1,
 )
+
+
+def feats_tag(model_name: str, fuse: tuple = FUSE, geo: bool = False, n_noloc: int = 0) -> str:
+    """Ключ кэша признаков val: модель эмбеддингов + настройки, отличные от умолчаний."""
+    tag = model_name.rstrip("/").split("/")[-1]
+    tag += "" if tuple(fuse) == FUSE else "_fuse" + "_".join(map(str, fuse))
+    tag += "_geo" if geo else ""
+    tag += f"_noloc{n_noloc}" if n_noloc else ""
+    return tag
 
 
 def ranker_features(X: pd.DataFrame) -> list[str]:
@@ -84,9 +93,20 @@ class MicrocatStats:
 
 class FeatureBuilder:
     def __init__(self, corpus: pd.DataFrame, train: pd.DataFrame, item_emb: np.ndarray, query_encoder,
-                 n_cand: int = 300):
+                 n_cand: int = 300, fuse: tuple = FUSE, geo: bool = False,
+                 n_noloc: int = 0, w_noloc: float = 0.01):
+        """geo / n_noloc — доработки по итогам анализа ошибок (experiments/07_error_analysis.py):
+          geo      гео-признаки: расстояние до «центра» локации поиска, нормированное на её радиус,
+                   встречалась ли пара (локация поиска, локация объявления) в train, ранг локации
+                   объявления в распределении P(item_loc | search_loc);
+          n_noloc  доп. источник кандидатов: top-n_noloc фьюжна с маленьким весом локации w_noloc.
+                   87% релевантных, не попавших в кандидаты, — из «чужой» локации.
+        По умолчанию выключены, чтобы воспроизводились отправки 2 и 3.
+        """
         self.corpus = corpus.reset_index(drop=True)
         self.n_cand = n_cand
+        self.fuse = fuse
+        self.geo, self.n_noloc, self.w_noloc = geo, n_noloc, w_noloc
         tok = item_tokens(self.corpus, "lemma")
         self.bm = SparseBM25().fit_fields([tok.title.values, tok.params.values, tok.desc.values], [3.0, 1.0, 1.0])
         self.bm_title = SparseBM25().fit(tok.title.values)
@@ -100,6 +120,10 @@ class FeatureBuilder:
         self.item_locs = c.item_location_id.values
         self.loc_set = set(self.item_locs)
         self.item_mc = c.item_microcat_id.values
+        if geo:
+            self.gp = GeoPrior().fit(train, c)
+            self.item_lat = c.item_latitude.astype(float).values
+            self.item_lon = c.item_longitude.astype(float).values
         # статичные признаки объявления
         self.item_feats = pd.DataFrame({
             "log_price": np.log1p(c.item_price.fillna(0).clip(lower=0)),
@@ -119,7 +143,7 @@ class FeatureBuilder:
         priors = {l: self.lp.log_prior(l, self.item_locs) for l in q.search_location_id.unique()}
         rel = qrels.groupby("query_id").item_id.apply(set).to_dict() if qrels is not None else {}
         ids = self.corpus.item_id.values
-        a, b, w = FUSE
+        a, b, w = self.fuse
         parts = []
         for sl in batched(len(q), 128):
             B = self.bm.scores(qlem[sl])
@@ -132,6 +156,8 @@ class FeatureBuilder:
                          topk_indices(C + 0.1 * L, self.n_cand),
                          topk_indices(F, self.n_cand)]
             top50_fuse = cand_sets[2][:, :50]
+            if self.n_noloc:
+                cand_sets.append(topk_indices(a * Bn + b * C + self.w_noloc * L, self.n_noloc))
             for j, i in enumerate(range(sl.start, sl.stop)):
                 cand = np.unique(np.concatenate([cs[j] for cs in cand_sets]))
                 row = q.iloc[i]
@@ -155,6 +181,18 @@ class FeatureBuilder:
                     "q_region": float(row.search_location_id not in self.loc_set),
                     "q_has_params": float(bool(row.search_infm_params_text)),
                 }
+                if self.geo:
+                    s_loc = row.search_location_id
+                    dist, dist_norm = self.gp.features(s_loc, self.item_lat[cand], self.item_lon[cand])
+                    obs = self.lp.dist.get(s_loc, {})
+                    loc_rank = {l: r for r, (l, _) in enumerate(sorted(obs.items(), key=lambda kv: -kv[1]), 1)}
+                    clocs = self.item_locs[cand]
+                    d.update({
+                        "geo_log_dist": np.log1p(dist),
+                        "geo_dist_norm": np.log1p(dist_norm),
+                        "loc_seen": np.array([l in obs for l in clocs], dtype=float),
+                        "loc_rank": np.log1p([loc_rank.get(l, 1000) for l in clocs]),
+                    })
                 df = pd.DataFrame(d)
                 if qrels is not None:
                     df["label"] = np.isin(ids[cand], list(rel.get(row.query_id, ()))).astype(int)
