@@ -8,29 +8,46 @@
 Скор запроса q = сумма W[:, t] по уникальным термам t запроса = Q @ W.T,
 где Q — бинарная матрица запросов. Всё считается одним sparse-dense умножением.
 """
+import itertools
+
 import numpy as np
 import scipy.sparse as sp
+from sklearn.feature_extraction.text import CountVectorizer
+
+
+def _split(doc):
+    return doc.split() if isinstance(doc, str) else doc
 
 
 class SparseBM25:
     def __init__(self, k1: float = 1.2, b: float = 0.75):
         self.k1, self.b = k1, b
 
-    def fit(self, docs: list[list[str]]):
-        vocab: dict[str, int] = {}
-        rows, cols = [], []
-        for i, toks in enumerate(docs):
-            for t in toks:
-                j = vocab.setdefault(t, len(vocab))
-                rows.append(i)
-                cols.append(j)
-        n = len(docs)
-        tf = sp.csr_matrix(
-            (np.ones(len(rows), dtype=np.float32), (rows, cols)), shape=(n, len(vocab))
-        )
-        tf.sum_duplicates()  # tf[i, j] = сколько раз терм j встретился в документе i
+    def fit(self, docs):
+        """docs: список документов (строки токенов через пробел или списки токенов)."""
+        return self.fit_fields([docs], [1.0])
+
+    def fit_fields(self, fields, weights):
+        """Документ = взвешенная сумма полей: tf = sum_f weight_f * tf_f.
+
+        fields: список полей, каждое — список длины n_docs (строки токенов через пробел).
+        Вес 3 у заголовка эквивалентен повторению заголовка 3 раза, но без копирования токенов.
+        CountVectorizer строит разреженную матрицу сразу, без промежуточных
+        Python-списков: на 340k длинных документах это экономит ~10 ГБ памяти.
+        """
+        n = len(fields[0])
+        cv = CountVectorizer(analyzer=_split, lowercase=False, dtype=np.float32)
+        X = cv.fit_transform(itertools.chain.from_iterable(fields)).tocsr()
+        tf = sum(w * X[i * n:(i + 1) * n] for i, w in enumerate(weights)).tocsr()
+        self._fit_tf(tf, cv.vocabulary_)
+        return self
+
+    def _fit_tf(self, tf: sp.csr_matrix, vocab: dict):
+        """tf[i, j] = (взвешенное) число вхождений терма j в документ i."""
+        tf.sort_indices()
+        n = tf.shape[0]
         dl = np.asarray(tf.sum(1)).ravel()
-        df = np.bincount(tf.indices, minlength=len(vocab))
+        df = np.bincount(tf.indices, minlength=tf.shape[1])
         idf = np.log(1 + (n - df + 0.5) / (df + 0.5)).astype(np.float32)
         # нормировка tf по длине документа (стандартная формула BM25)
         norm = self.k1 * (1 - self.b + self.b * dl / dl.mean())
@@ -39,7 +56,6 @@ class SparseBM25:
         data *= idf[tf.indices]
         self.W_T = sp.csr_matrix((data, tf.indices, tf.indptr), shape=tf.shape).T.tocsr()
         self.vocab, self.idf, self.n_docs = vocab, idf, n
-        return self
 
     def query_matrix(self, queries: list[list[str]]) -> sp.csr_matrix:
         rows, cols = [], []

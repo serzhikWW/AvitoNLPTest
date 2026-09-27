@@ -45,9 +45,18 @@ def _fix_types(df: pd.DataFrame) -> pd.DataFrame:
     for c in ("item_price", "item_latitude", "item_longitude"):
         if c in df:
             df[c] = df[c].astype(float)
+    return compact_text(df)
+
+
+def compact_text(df: pd.DataFrame) -> pd.DataFrame:
+    """Текстовые колонки -> string[pyarrow] (пропуски -> "").
+
+    Arrow-строки лежат в одном буфере, а не миллионами Python-объектов: на корпусе
+    в 340k объявлений с длинными описаниями это экономит несколько ГБ памяти.
+    """
     for c in df.columns:
         if c.endswith(("_raw", "_text")) or c == "search_query":
-            df[c] = df[c].fillna("").astype(str)
+            df[c] = df[c].astype("string[pyarrow]").fillna("")
     return df
 
 

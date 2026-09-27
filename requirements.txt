@@ -7,3 +7,8 @@ pymorphy3
 pymorphy3-dicts-ru
 PyStemmer
 tqdm
+torch
+sentence-transformers
+datasets
+accelerate
+lightgbm

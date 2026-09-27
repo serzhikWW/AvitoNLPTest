@@ -21,7 +21,7 @@
 import numpy as np
 import pandas as pd
 
-from .data import CACHE_DIR, ITEM_COLS, QUERY_COLS, load_bench_items, load_train
+from .data import CACHE_DIR, ITEM_COLS, QUERY_COLS, compact_text, load_bench_items, load_train
 
 GROUP_KEY = ["search_query", "search_location_id", "search_infm_params_text", "search_category"]
 SEED = 42
@@ -88,9 +88,71 @@ def load_split():
     if not (CACHE_DIR / "val_corpus.parquet").exists():
         build_split()
     return tuple(
-        pd.read_parquet(CACHE_DIR / f"val_{n}.parquet")
+        compact_text(pd.read_parquet(CACHE_DIR / f"val_{n}.parquet"))
         for n in ("train_fit", "queries", "qrels", "corpus")
     )
+
+
+def build_hard_corpus(n_distractors: int = 100, pool_top: int = 200, seed: int = SEED) -> pd.DataFrame:
+    """Корпус val v2 с имитацией «выдачи» для каждого val-запроса.
+
+    Проблема val v1: корпус бенчмарка, судя по всему, собран из выдач по его же
+    запросам, поэтому у запроса бенчмарка в корпусе десятки похожих объявлений из
+    той же локации («конкуренты»; см. experiments/03_competitors.py). В val v1
+    позитив вставлен в корпус один, и найти его заметно легче: 0.870 на val
+    против 0.809 на бенчмарке.
+
+    Решение: для каждого val-запроса добавляем n_distractors объявлений из train-fit,
+    похожих на запрос и из «его» локаций: сначала top-pool_top по BM25 среди объявлений
+    из допустимых локаций, затем случайная выборка из них. Случайная выборка нужна,
+    чтобы дистракторы не были подогнаны строго против BM25: иначе он выглядел бы на
+    валидации хуже других методов.
+    Допустимые локации — те, что покрывают 90% массы P(item_loc | search_loc) по train-fit.
+    """
+    from .bm25 import SparseBM25
+    from .location import LocationPrior
+    from .retrieval import topk_indices
+    from .text import normalize
+    from .tokens import item_tokens
+
+    path = CACHE_DIR / f"val_corpus_hard_{n_distractors}.parquet"
+    if path.exists():
+        return compact_text(pd.read_parquet(path))
+    train_fit, queries, qrels, corpus = load_split()
+    rng = np.random.default_rng(seed)
+
+    # пул: объявления train-fit, которых ещё нет в корпусе и которые не являются позитивами val
+    pool = train_fit[ITEM_COLS].drop_duplicates("item_id")
+    pool = pool[~pool.item_id.isin(set(corpus.item_id))].reset_index(drop=True)
+    tok = item_tokens(pool, "lemma")
+    bm = SparseBM25().fit_fields([tok.title.values, tok.params.values, tok.desc.values], [3.0, 1.0, 1.0])
+    lp = LocationPrior().fit(train_fit)
+    pool_locs = pool.item_location_id.values
+
+    chosen = set()
+    for text, loc in zip(queries.search_query.values, queries.search_location_id.values):
+        probs = sorted(lp.probs(loc).items(), key=lambda kv: -kv[1])
+        allowed, mass = [], 0.0
+        for l, p in probs:
+            allowed.append(l)
+            mass += p
+            if mass >= 0.9:
+                break
+        mask = np.isin(pool_locs, allowed)
+        if not mask.any():
+            continue
+        s = bm.scores([normalize(text)])[0]
+        s[~mask] = -np.inf
+        s[s <= 0] = -np.inf  # только объявления, где есть хоть одно слово запроса
+        top = topk_indices(s[None], pool_top)[0]
+        top = top[np.isfinite(s[top])]
+        pick = rng.choice(top, min(n_distractors, len(top)), replace=False) if len(top) else []
+        chosen.update(pick)
+
+    hard = pd.concat([corpus, pool.iloc[sorted(chosen)]], ignore_index=True)
+    hard.to_parquet(path)
+    print(f"hard corpus: {len(corpus)} + {len(chosen)} distractors = {len(hard)}")
+    return hard
 
 
 def recall_at_k(predictions: dict, qrels: pd.DataFrame, k: int = 50) -> pd.Series:
@@ -119,3 +181,4 @@ def report(predictions: dict, queries: pd.DataFrame, qrels: pd.DataFrame, name: 
 
 if __name__ == "__main__":
     build_split()
+    build_hard_corpus()

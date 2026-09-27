@@ -222,3 +222,5 @@ NLP_avito_interns-dataset/
 cache/
 .idea/
 answer*.csv
+models/
+.DS_Store
