@@ -1,14 +1,20 @@
-pandas
-pyarrow
-numpy
-scipy
-scikit-learn
-pymorphy3
-pymorphy3-dicts-ru
-PyStemmer
-tqdm
-torch
-sentence-transformers
-datasets
-accelerate
-lightgbm
+# Версии, на которых получены отправки (Python 3.12, macOS / Apple M3 Pro).
+# torch с CUDA для обучения на GPU: pip install torch --index-url https://download.pytorch.org/whl/cu124
+pandas==3.0.6
+pyarrow==25.0.1
+numpy==2.5.3
+scipy==1.18.1
+scikit-learn==1.9.1
+pymorphy3==2.0.6
+pymorphy3-dicts-ru==2.4.417150.4580142
+PyStemmer==3.1.0
+tqdm==4.70.1
+lightgbm==4.7.0
+torch==2.14.0
+transformers==5.17.0
+sentence-transformers==6.1.0
+datasets==5.0.1
+accelerate==1.15.0
+# ноутбук
+jupyter==1.1.1
+matplotlib==3.11.2
