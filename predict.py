@@ -25,39 +25,29 @@ import pandas as pd
 
 from src.baseline import predict_v1
 from src.data import CACHE_DIR, ROOT, load_bench_items, load_bench_queries, load_train
-from src.ranker import FUSE, FeatureBuilder, feats_tag, fit_ranker, ranker_features
+from src.pipeline import TRAIN_COLS, make_builder
+from src.ranker import FUSE, feats_tag, fit_ranker, ranker_features
 
 
 def val_features(dense_name: str, opts: dict) -> pd.DataFrame:
     """Признаки + метки на val-запросах (с кэшем): обучающая выборка ранкера."""
-    from src.dense import DenseRetriever
     from src.validation import build_hard_corpus, load_split
 
     path = CACHE_DIR / f"ranker_feats_val_{feats_tag(dense_name, **opts)}.parquet"
     if path.exists():
         return pd.read_parquet(path)
     train_fit, queries, qrels, _ = load_split()
-    corpus = build_hard_corpus()
-    dr = DenseRetriever(dense_name)
-    fb = FeatureBuilder(corpus, train_fit, dr.item_embeddings(corpus), dr.query_embeddings, **opts)
-    X = fb.build(queries, qrels)
+    X = make_builder(build_hard_corpus(), train_fit, dense_name, **opts).build(queries, qrels)
     X.to_parquet(path)
     return X
 
 
 def bench_features(dense_name: str, opts: dict) -> pd.DataFrame:
     """Признаки кандидатов бенчмарка (с кэшем): статистики по всему train, корпус бенчмарка."""
-    from src.dense import DenseRetriever
-
     path = CACHE_DIR / f"ranker_feats_bench_{feats_tag(dense_name, **opts)}.parquet"
     if path.exists():
         return pd.read_parquet(path)
-    items = load_bench_items()
-    train = load_train(columns=["search_query", "search_location_id", "item_location_id",
-                                "item_microcat_id", "item_id", "item_latitude", "item_longitude"])
-    dr = DenseRetriever(dense_name)
-    fb = FeatureBuilder(items, train, dr.item_embeddings(items), dr.query_embeddings, **opts)
-    B = fb.build(load_bench_queries())
+    B = make_builder(load_bench_items(), load_train(columns=TRAIN_COLS), dense_name, **opts).build(load_bench_queries())
     B.to_parquet(path)
     return B
 
@@ -88,6 +78,8 @@ def main():
                     help="веса фьюжна a,b,w: a*bm25_norm + b*cos + w*logP(loc)")
     ap.add_argument("--geo", action="store_true", help="гео-признаки (по итогам анализа ошибок)")
     ap.add_argument("--noloc", type=int, default=0, help="доп. кандидаты без сильного приора локации")
+    ap.add_argument("--profile", action="store_true", help="профиль кликов похожих запросов (src/profile.py)")
+    ap.add_argument("--extra-dense", nargs="*", default=[], help="доп. bi-encoder'ы, их косинус как признак")
     ap.add_argument("--out", default="answer.csv")
     args = ap.parse_args()
 
@@ -96,7 +88,8 @@ def main():
         train = load_train(columns=["search_location_id", "item_location_id"])
         preds = predict_v1(queries, load_bench_items(), train)
     else:
-        opts = dict(fuse=tuple(float(x) for x in args.fuse.split(",")), geo=args.geo, n_noloc=args.noloc)
+        opts = dict(fuse=tuple(float(x) for x in args.fuse.split(",")), geo=args.geo, n_noloc=args.noloc,
+                    profile=args.profile, extra_dense=tuple(args.extra_dense))
         preds = predict_ranker(args.dense, args.dense_val or args.dense, opts)
 
     answer = pd.DataFrame({

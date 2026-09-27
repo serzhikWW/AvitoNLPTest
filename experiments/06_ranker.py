@@ -4,7 +4,7 @@
 меряем 5-fold кросс-валидацией по запросам: учим на 4/5 запросов, top-50 строим на 1/5.
 Recall считается по ВСЕМ релевантным (в т.ч. не попавшим в кандидаты), как в метрике.
 
-Запуск: .venv/bin/python -m experiments.06_ranker [модель] [--fuse a,b,w] [--geo] [--noloc N]
+Запуск: .venv/bin/python -m experiments.06_ranker [модель] [--fuse a,b,w] [--geo] [--noloc N] [--profile] [--extra-dense M ...]
 """
 import argparse
 
@@ -14,8 +14,8 @@ import pandas as pd
 from sklearn.model_selection import GroupKFold
 
 from src.data import CACHE_DIR
-from src.dense import DenseRetriever
-from src.ranker import FUSE, LGB_PARAMS, STATIC_ITEM, FeatureBuilder, feats_tag
+from src.pipeline import make_builder
+from src.ranker import FUSE, LGB_PARAMS, STATIC_ITEM, feats_tag
 from src.validation import build_hard_corpus, load_split, recall_at_k
 
 ap = argparse.ArgumentParser()
@@ -23,10 +23,13 @@ ap.add_argument("model", nargs="?", default="intfloat/multilingual-e5-small")
 ap.add_argument("--fuse", default=None, help="веса a,b,w: a*bm25_norm + b*cos + w*logP(loc)")
 ap.add_argument("--geo", action="store_true", help="гео-признаки (см. FeatureBuilder)")
 ap.add_argument("--noloc", type=int, default=0, help="доп. кандидаты фьюжна без сильного приора локации")
+ap.add_argument("--profile", action="store_true", help="профиль кликов похожих запросов")
+ap.add_argument("--extra-dense", nargs="*", default=[], help="доп. bi-encoder'ы (косинус как признак)")
 args = ap.parse_args()
 model_name = args.model
 fuse = tuple(float(x) for x in args.fuse.split(",")) if args.fuse else FUSE
-feat_path = CACHE_DIR / f"ranker_feats_val_{feats_tag(model_name, fuse, args.geo, args.noloc)}.parquet"
+opts = dict(fuse=fuse, geo=args.geo, n_noloc=args.noloc, profile=args.profile, extra_dense=tuple(args.extra_dense))
+feat_path = CACHE_DIR / f"ranker_feats_val_{feats_tag(model_name, **opts)}.parquet"
 
 train_fit, queries, qrels, _ = load_split()
 corpus = build_hard_corpus()
@@ -35,10 +38,7 @@ ids = corpus.item_id.values
 if feat_path.exists():
     X = pd.read_parquet(feat_path)
 else:
-    dr = DenseRetriever(model_name)
-    fb = FeatureBuilder(corpus, train_fit, dr.item_embeddings(corpus), dr.query_embeddings, fuse=fuse,
-                        geo=args.geo, n_noloc=args.noloc)
-    X = fb.build(queries, qrels)
+    X = make_builder(corpus, train_fit, model_name, **opts).build(queries, qrels)
     X.to_parquet(feat_path)
 
 FEATURES = [c for c in X.columns if c not in ("query_id", "item_idx", "label")]

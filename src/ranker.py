@@ -45,12 +45,15 @@ LGB_PARAMS = dict(
 )
 
 
-def feats_tag(model_name: str, fuse: tuple = FUSE, geo: bool = False, n_noloc: int = 0) -> str:
+def feats_tag(model_name: str, fuse: tuple = FUSE, geo: bool = False, n_noloc: int = 0,
+              profile: bool = False, extra_dense: tuple = ()) -> str:
     """Ключ кэша признаков val: модель эмбеддингов + настройки, отличные от умолчаний."""
     tag = model_name.rstrip("/").split("/")[-1]
     tag += "" if tuple(fuse) == FUSE else "_fuse" + "_".join(map(str, fuse))
     tag += "_geo" if geo else ""
     tag += f"_noloc{n_noloc}" if n_noloc else ""
+    tag += "_prof" if profile else ""
+    tag += "".join(f"_x{m.rstrip('/').split('/')[-1]}" for m in extra_dense)
     return tag
 
 
@@ -96,15 +99,21 @@ class MicrocatStats:
 class FeatureBuilder:
     def __init__(self, corpus: pd.DataFrame, train: pd.DataFrame, item_emb: np.ndarray, query_encoder,
                  n_cand: int = 300, fuse: tuple = FUSE, geo: bool = False,
-                 n_noloc: int = 0, w_noloc: float = 0.01):
+                 n_noloc: int = 0, w_noloc: float = 0.01, profile=None, extra_dense=None):
         """geo / n_noloc — доработки по итогам анализа ошибок (experiments/07_error_analysis.py):
           geo      гео-признаки: расстояние до «центра» локации поиска, нормированное на её радиус,
                    встречалась ли пара (локация поиска, локация объявления) в train, ранг локации
                    объявления в распределении P(item_loc | search_loc);
           n_noloc  доп. источник кандидатов: top-n_noloc фьюжна с маленьким весом локации w_noloc.
                    87% релевантных, не попавших в кандидаты, — из «чужой» локации.
-        По умолчанию выключены, чтобы воспроизводились отправки 2 и 3.
+          profile  обученный ClickProfile (src/profile.py): косинус кандидата с профилем кликов
+                   похожих запросов и распределение подкатегорий по ним;
+          extra_dense  список (имя, эмбеддинги корпуса, кодировщик запросов) дополнительных
+                   bi-encoder'ов: их косинус и ранг — отдельные признаки (ансамбль моделей).
+        По умолчанию всё выключено, чтобы воспроизводились прошлые отправки.
         """
+        self.profile = profile
+        self.extra_dense = [(n, e.astype(np.float32), enc) for n, e, enc in (extra_dense or [])]
         self.corpus = corpus.reset_index(drop=True)
         self.n_cand = n_cand
         self.fuse = fuse
@@ -144,6 +153,8 @@ class FeatureBuilder:
         Qe = self.encode(q.search_query.tolist()).astype(np.float32)
         priors = {l: self.lp.log_prior(l, self.item_locs) for l in q.search_location_id.unique()}
         rel = qrels.groupby("query_id").item_id.apply(set).to_dict() if qrels is not None else {}
+        profs = self.profile.query_profiles(Qe) if self.profile is not None else None
+        Qx = [enc(q.search_query.tolist()).astype(np.float32) for _, _, enc in self.extra_dense]
         ids = self.corpus.item_id.values
         a, b, w = self.fuse
         parts = []
@@ -158,6 +169,7 @@ class FeatureBuilder:
                          topk_indices(C + 0.1 * L, self.n_cand),
                          topk_indices(F, self.n_cand)]
             top50_fuse = cand_sets[2][:, :50]
+            Cx = [Qx[k][sl] @ E.T for k, (_, E, _) in enumerate(self.extra_dense)]
             if self.n_noloc:
                 cand_sets.append(topk_indices(a * Bn + b * C + self.w_noloc * L, self.n_noloc))
             for j, i in enumerate(range(sl.start, sl.stop)):
@@ -195,13 +207,19 @@ class FeatureBuilder:
                         "loc_seen": np.array([l in obs for l in clocs], dtype=float),
                         "loc_rank": np.log1p([loc_rank.get(l, 1000) for l in clocs]),
                     })
+                for (name, _, _), Ck in zip(self.extra_dense, Cx):
+                    d[f"cos_{name}"] = Ck[j, cand]
+                if profs is not None:
+                    prof_cos, p_mc_nn = self.profile.candidate_features(profs[i], self.E[cand], ids[cand], cmc)
+                    d.update({"prof_cos": prof_cos, "p_mc_nn": p_mc_nn, "q_nn_sim": profs[i][3]})
                 df = pd.DataFrame(d)
                 if qrels is not None:
                     df["label"] = np.isin(ids[cand], list(rel.get(row.query_id, ()))).astype(int)
                 parts.append(df)
         out = pd.concat(parts, ignore_index=True)
         # ранги внутри кандидатов запроса (устойчивее к масштабу скоров, чем сами скоры)
-        for f in ["bm25", "cos", "fuse", "bm25_title"]:
+        extra = [f"cos_{n}" for n, _, _ in self.extra_dense] + (["prof_cos"] if self.profile is not None else [])
+        for f in ["bm25", "cos", "fuse", "bm25_title"] + extra:
             out[f"{f}_rank"] = out.groupby("query_id")[f].rank(ascending=False, method="first")
         return pd.concat([out, self.item_feats.iloc[out.item_idx.values].reset_index(drop=True)], axis=1)
 
